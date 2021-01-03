@@ -1,0 +1,185 @@
+use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures::{Sink, Stream, StreamExt};
+use std::{io, pin::Pin, task::{Poll, Context}};
+use bytes::{BytesMut, BufMut, Buf};
+use pin_project::*;
+use tokio_util::codec::{Encoder, Decoder, Framed};
+use std::ops::Deref;
+use std::net::SocketAddr;
+use super::options::SocketOptions;
+
+const PIPELINE_HANDSHAKE_PACKET : [u8; 8] = [0x00, 0x53, 0x50, 0x00, 0x00, 0x50, 0x00, 0x00];
+
+#[pin_project]
+pub struct NanomsgPipeline {
+    #[pin]
+    inner : tokio_util::codec::Framed<TcpStream, NanomsgPipelineCodec>
+}
+
+impl NanomsgPipeline {
+    pub async fn connect<A: ToSocketAddrs>(address: A) -> io::Result<Self> {
+        Self::connect_with_socket_options(address, SocketOptions::default()).await
+    }
+
+    pub async fn connect_with_socket_options<A>(address: A,
+                                                socket_options: SocketOptions) -> io::Result<Self>
+        where A: ToSocketAddrs {
+
+        let mut tcp_stream = tokio::net::TcpStream::connect(address).await?;
+
+        socket_options.apply_to_tcpstream(&tcp_stream)?;
+
+
+        tcp_stream.write_all(&PIPELINE_HANDSHAKE_PACKET[..]).await?;
+        
+        let mut incoming_handshake= [0u8; 8];
+        tcp_stream.read_exact(&mut incoming_handshake).await?;
+
+        if incoming_handshake != PIPELINE_HANDSHAKE_PACKET {
+            return Err(io::Error::from(io::ErrorKind::InvalidData))
+        }
+
+        let codec = NanomsgPipelineCodec::new();
+
+        let framed_parts = tokio_util::codec::FramedParts::new::<&[u8]>(tcp_stream, codec);
+        let framed = Framed::from_parts(framed_parts);
+        Ok(Self {
+            inner: framed
+        })
+    }
+
+    pub async fn listen<A>(address: A) -> io::Result<impl Stream<Item = io::Result<(SocketAddr, NanomsgPipeline)>> + Unpin>
+        where A: ToSocketAddrs {
+
+        let listener = tokio::net::TcpListener::bind(address).await?;
+
+        Ok(Box::pin(listener.then(|stream| async {
+            let mut stream = stream?;
+            stream.write_all(&PIPELINE_HANDSHAKE_PACKET[..]).await?;
+            let address = stream.peer_addr()?;
+
+            let mut incoming_handshake= [0u8; 8];
+            stream.read_exact(&mut incoming_handshake).await?;
+    
+            if incoming_handshake != PIPELINE_HANDSHAKE_PACKET {
+                return Err(io::Error::from(io::ErrorKind::InvalidData))
+            }
+            let codec = NanomsgPipelineCodec::new();
+
+            let framed_parts = tokio_util::codec::FramedParts::new::<&[u8]>(stream, codec);
+            let framed = Framed::from_parts(framed_parts);
+            Ok((address, NanomsgPipeline {
+                inner: framed
+            }))
+        })))
+    }
+}
+
+impl Stream for NanomsgPipeline {
+    type Item = io::Result<Vec<u8>>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        this.inner.poll_next(cx)
+    }
+}
+
+impl <I> Sink<I> for NanomsgPipeline 
+    where I: Deref<Target=[u8]>{
+    type Error = io::Error;
+
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<Result<(), Self::Error>> {
+        let this = self.project();
+        <Framed<TcpStream, NanomsgPipelineCodec> as Sink<I>>::poll_ready(this.inner, cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: I) -> Result<(), Self::Error> {
+        let this = self.project();
+        this.inner.start_send(item)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<Result<(), Self::Error>> {
+        let this = self.project();
+        <Framed<TcpStream, NanomsgPipelineCodec> as Sink<I>>::poll_flush(this.inner, cx)
+    }
+
+    fn poll_close(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>
+    ) -> Poll<Result<(), Self::Error>> {
+        let this = self.project();
+        <Framed<TcpStream, NanomsgPipelineCodec> as Sink<I>>::poll_close(this.inner, cx)
+    }
+}
+
+
+enum DecodingState {
+    Size,
+    Payload(usize)
+}
+
+struct NanomsgPipelineCodec {
+    decoding_state: DecodingState,
+}
+
+impl NanomsgPipelineCodec {
+    pub fn new() -> Self {
+        Self {
+            decoding_state: DecodingState::Size,
+        }
+    }
+}
+
+impl <T>Encoder<T> for NanomsgPipelineCodec 
+    where T: std::ops::Deref<Target = [u8]> {
+
+    type Error = io::Error;
+
+    fn encode(&mut self, item: T, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.reserve(item.len() + 8);
+        dst.put_u64(item.len() as _);
+        dst.put(item.as_ref());
+        Ok(())
+    }
+}
+
+impl Decoder for NanomsgPipelineCodec {
+    type Item = Vec<u8>;
+    type Error = io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        use std::mem::replace;
+
+        loop {
+            match self.decoding_state {
+                DecodingState::Size => {
+                    if src.remaining() >= 8 {
+                        let size = src.get_u64() as _;
+                        let _ = replace(&mut self.decoding_state, DecodingState::Payload(size));
+                    } else {
+                        return Ok(None)
+                    }
+                }
+                DecodingState::Payload(size) => {
+                    if src.remaining() >= size {
+                        let payload = src.split_to(size);
+                        let _ = replace(&mut self.decoding_state, DecodingState::Size);
+                        return Ok(Some(payload.to_vec()))
+                    } else {
+                        return Ok(None)
+                    }
+                }
+            }
+        }
+    }
+}
